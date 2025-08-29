@@ -1,0 +1,174 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>WebRTC Browser Sender (Manual Signaling)</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 24px; }
+    textarea { width: 100%; height: 180px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    button { padding: 10px 14px; border-radius: 10px; border: 1px solid #ddd; cursor: pointer; }
+    video { width: 100%; background: #111; border-radius: 12px; }
+    .small { color:#666; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <h2>Browser → WebRTC → C++(GStreamer)</h2>
+
+  <p>
+    이 페이지는 <b>수동 시그널링</b> 데모입니다. 아래 순서로 사용하세요:
+  </p>
+  <ol>
+    <li>C++ 수신 앱이 출력하는 <b>SDP OFFER</b>를 전체 복사해서 아래 박스에 붙여넣고, <b>오퍼 적용 + 답변 생성</b>을 누르세요.</li>
+    <li>잠시 기다리면 ICE 수집이 완료되고, <b>SDP ANSWER</b>가 생성됩니다. 이를 C++ 콘솔에 붙여넣고 맨 아래에 <code>===== END SDP =====</code> 줄을 추가하세요.</li>
+  </ol>
+
+  <div class="row">
+    <div>
+      <h3>1) C++에서 받은 SDP OFFER</h3>
+      <textarea id="offerIn" placeholder="여기에 C++에서 출력한 SDP OFFER를 붙여넣으세요"></textarea>
+      <button id="btnApplyOffer">오퍼 적용 + 답변 생성</button>
+      <p class="small">* 오퍼를 적용하면 자동으로 로컬 설명을 설정하고 ICE 후보 수집을 완료할 때까지 대기합니다. (헤더/푸터 라인이 포함되어도 자동으로 처리됩니다)</p>
+    </div>
+    <div>
+      <h3>2) 브라우저가 만든 SDP ANSWER</h3>
+      <textarea id="answerOut" placeholder="여기에 생성된 SDP ANSWER가 표시됩니다" readonly></textarea>
+      <button id="btnCopyAnswer">답변 복사</button>
+    </div>
+  </div>
+
+  <h3>미리보기</h3>
+  <video id="local" autoplay playsinline muted></video>
+
+  <script>
+    const pc = new RTCPeerConnection({
+      iceServers: [{ urls: ["stun:stun.l.google.com:19302"] }]
+    });
+
+    const localVideo = document.getElementById('local');
+    const offerIn = document.getElementById('offerIn');
+    const answerOut = document.getElementById('answerOut');
+    const btnApplyOffer = document.getElementById('btnApplyOffer');
+    const btnCopyAnswer = document.getElementById('btnCopyAnswer');
+
+    // 1) 로컬 카메라 가져와 트랙 추가
+    (async () => {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+        localVideo.srcObject = stream;
+        for (const track of stream.getTracks()) pc.addTrack(track, stream);
+      } catch (e) {
+        alert('getUserMedia 실패: ' + e);
+      }
+    })();
+
+    // ICE 수집 완료 대기 → ANSWER 텍스트 에어리어에 최종 SDP 기록
+    function waitIceCompleted() {
+      return new Promise((resolve) => {
+        if (pc.iceGatheringState === 'complete') return resolve();
+        function check() {
+          if (pc.iceGatheringState === 'complete') {
+            pc.removeEventListener('icegatheringstatechange', check);
+            resolve();
+          }
+        }
+        pc.addEventListener('icegatheringstatechange', check);
+      });
+    }
+
+    function extractSdp(text) {
+      // 1) CR 제거
+      let s = text.replace(/\r/g, '');
+      // 2) 시작 위치: 첫 'v='부터
+      const vpos = s.indexOf('\nv=');
+      let startIdx = 0;
+      if (s.startsWith('v=')) startIdx = 0; else if (vpos !== -1) startIdx = vpos + 1; else startIdx = s.indexOf('v=');
+      if (startIdx < 0) return '';
+      s = s.slice(startIdx);
+      // 3) 끝 위치: '===== END SDP =====' 이전까지 잘라내기 (같은 줄에 붙어있는 경우 포함)
+      const endMarker = '===== END SDP =====';
+      const epos = s.indexOf(endMarker);
+      if (epos !== -1) s = s.slice(0, epos);
+
+      // 4) 라인 필터링
+      const lines = s.split('\n').filter(l => {
+        const t = l.trim();
+        if (!t) return false; // 빈 줄 제거
+        if (t.startsWith('=====')) return false;
+        if (/^a=end-of-candidates\b/.test(t)) return false;
+
+        // --- 알려진 문제 라인 필터링 ---
+        // 핵심 문제 라인인 host 후보 제거
+        if (/^a=candidate:/i.test(t) && /\btyp\s+host\b/i.test(t)) return false;
+        // 2차 문제 가능성이 있었던 라인 제거
+        if (/^a=rtcp-mux-only/.test(t)) return false;
+
+        // 기타 표준 호환성 필터
+        if (/^a=candidate:/i.test(t) && /\btcp\b/i.test(t)) return false;
+        if (/^a=candidate:/i.test(t) && /\btcptype\b/i.test(t)) return false;
+        if (/^a=candidate:/i.test(t) && /\btyp\s+srflx\b/i.test(t)) return false;
+        if (/^a=candidate:/i.test(t) && /:[0-9a-f]+:/i.test(t)) return false;
+        return true;
+      });
+
+      // SDP 표준(RFC)에 따라 CRLF(\r\n)로 라인을 다시 조합하고, 마지막에도 CRLF를 추가.
+      if (lines.length === 0) return '';
+      return lines.join('\r\n') + '\r\n';
+    }
+
+    async function waitIceCompletedWithTimeout(ms = 15000) {
+      try {
+        await Promise.race([
+          waitIceCompleted(),
+          new Promise(resolve => setTimeout(resolve, ms))
+        ]);
+      } catch (_) {}
+    }
+
+    btnApplyOffer.onclick = async () => {
+      const raw = offerIn.value;
+      const sdp = extractSdp(raw);
+      if (!sdp) { alert('유효한 SDP OFFER를 붙여넣으세요'); return; }
+
+      btnApplyOffer.disabled = true;
+      btnApplyOffer.textContent = '처리 중...';
+      try {
+        await pc.setRemoteDescription({ type: 'offer', sdp });
+      } catch (e) {
+        console.error('setRemoteDescription 실패:', e);
+        alert('setRemoteDescription 실패: ' + e);
+        btnApplyOffer.disabled = false;
+        btnApplyOffer.textContent = '오퍼 적용 + 답변 생성';
+        return;
+      }
+
+      try {
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+      } catch (e) {
+        console.error('ANSWER 생성 실패:', e);
+        alert('ANSWER 생성 실패: ' + e);
+        btnApplyOffer.disabled = false;
+        btnApplyOffer.textContent = '오퍼 적용 + 답변 생성';
+        return;
+      }
+
+      await waitIceCompletedWithTimeout(15000);
+      answerOut.value = pc.localDescription ? pc.localDescription.sdp : '';
+      if (!answerOut.value) {
+        alert('ANSWER SDP가 비어 있습니다. 브라우저 콘솔을 확인하세요.');
+      }
+      btnApplyOffer.disabled = false;
+      btnApplyOffer.textContent = '오퍼 적용 + 답변 생성';
+    };
+
+    btnCopyAnswer.onclick = async () => {
+      answerOut.select();
+      try { await navigator.clipboard.writeText(answerOut.value); }
+      catch (e) { document.execCommand('copy'); }
+      alert('복사했습니다. C++ 콘솔에 붙여넣고 마지막 줄에 "===== END SDP ====="를 추가하세요.');
+    };
+  </script>
+</body>
+</html>
