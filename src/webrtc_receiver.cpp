@@ -54,14 +54,7 @@ static std::string sanitize_sdp_for_browser(const char* sdp_in) {
             if (low.find(" tcp ") != std::string::npos || low.find("\ttcp ") != std::string::npos || low.find(" tcptype ") != std::string::npos) {
                 continue;
             }
-            // srflx 후보 제거 (브라우저 파서 에러 회피용)
-            if (low.find(" typ srflx") != std::string::npos) {
-                continue;
-            }
-            // host 후보 제거 (GStreamer webrtcbin이 일부 host 후보 처리시 문제 발생)
-            if (low.find(" typ host") != std::string::npos) {
-                continue;
-            }
+            // 이전에는 srflx/host 후보를 제거했으나, 모든 ICE 후보를 전달하기 위해 유지합니다.
             // IPv6 주소 후보 제거 (일부 브라우저/환경에서 파서 민감)
             std::vector<std::string> tokens;
             {
@@ -358,38 +351,36 @@ int main(int argc, char* argv[]) {
     if (vcaps) gst_caps_unref(vcaps);
     if (vtrans) gst_object_unref(vtrans);
 
-    std::thread ui_thread_func([](){
-        cv::namedWindow("WebRTC-Recv", cv::WINDOW_AUTOSIZE);
-        while (g_running.load()) {
-            cv::Mat frame;
-            {
-                std::lock_guard<std::mutex> lock(g_frame_mutex);
-                if (!g_latest_frame.empty()) frame = g_latest_frame.clone();
-            }
-            if (!frame.empty()) {
-                cv::imshow("WebRTC-Recv", frame);
-            }
-            int key = cv::waitKey(10);
-            if (key == 27 || key == 'q' || key == 'Q') {
-                g_running.store(false);
-                if (g_loop) g_main_loop_quit(g_loop);
-                break;
-            }
-        }
-        cv::destroyWindow("WebRTC-Recv");
-    });
-    ui_thread_func.detach();
-
     gst_element_set_state(g_pipeline, GST_STATE_PLAYING);
 
     g_print("\n[Receiver] Waiting... This app will create an SDP OFFER.\n");
     g_print("Once it prints the OFFER, paste it into the browser page.\n\n");
 
-    g_main_loop_run(g_loop);
+    std::thread gst_thread([](){ g_main_loop_run(g_loop); });
+
+    cv::namedWindow("WebRTC-Recv", cv::WINDOW_AUTOSIZE);
+    while (g_running.load()) {
+        cv::Mat frame;
+        {
+            std::lock_guard<std::mutex> lock(g_frame_mutex);
+            if (!g_latest_frame.empty()) frame = g_latest_frame.clone();
+        }
+        if (!frame.empty()) {
+            cv::imshow("WebRTC-Recv", frame);
+        }
+        int key = cv::waitKey(10);
+        if (key == 27 || key == 'q' || key == 'Q') {
+            g_running.store(false);
+            if (g_loop) g_main_loop_quit(g_loop);
+            break;
+        }
+    }
+    cv::destroyWindow("WebRTC-Recv");
+
+    gst_thread.join();
 
     gst_element_set_state(g_pipeline, GST_STATE_NULL);
     gst_object_unref(g_pipeline);
     g_main_loop_unref(g_loop);
-    g_running.store(false);
     return 0;
 }

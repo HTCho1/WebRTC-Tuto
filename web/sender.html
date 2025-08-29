@@ -99,15 +99,11 @@
         if (/^a=end-of-candidates\b/.test(t)) return false;
 
         // --- 알려진 문제 라인 필터링 ---
-        // 핵심 문제 라인인 host 후보 제거
-        if (/^a=candidate:/i.test(t) && /\btyp\s+host\b/i.test(t)) return false;
-        // 2차 문제 가능성이 있었던 라인 제거
         if (/^a=rtcp-mux-only/.test(t)) return false;
 
         // 기타 표준 호환성 필터
         if (/^a=candidate:/i.test(t) && /\btcp\b/i.test(t)) return false;
         if (/^a=candidate:/i.test(t) && /\btcptype\b/i.test(t)) return false;
-        if (/^a=candidate:/i.test(t) && /\btyp\s+srflx\b/i.test(t)) return false;
         if (/^a=candidate:/i.test(t) && /:[0-9a-f]+:/i.test(t)) return false;
         return true;
       });
