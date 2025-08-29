@@ -305,6 +305,8 @@ static void on_notify_ice_gathering(GObject* obj, GParamSpec* /*pspec*/, gpointe
         g_free(sdp_str);
         gst_webrtc_session_description_free(local_desc);
 
+        GMainContext* ctx = g_main_loop_get_context(g_loop);
+
         std::thread([=]() {
             g_print("Paste the SDP ANSWER from browser, then end with a line: '===== END SDP ====='\n");
             std::string raw_answer = read_sdp_from_stdin();
@@ -314,7 +316,7 @@ static void on_notify_ice_gathering(GObject* obj, GParamSpec* /*pspec*/, gpointe
                 return;
             }
             // Pass the sanitized SDP to the main loop for processing
-            g_idle_add(on_answer_received, g_strdup(answer.c_str()));
+            g_main_context_invoke(ctx, on_answer_received, g_strdup(answer.c_str()));
         }).detach();
     }
 }
