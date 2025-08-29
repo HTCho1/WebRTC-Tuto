@@ -363,6 +363,7 @@ int main(int argc, char* argv[]) {
     cv::namedWindow("WebRTC-Recv", cv::WINDOW_AUTOSIZE);
     while (g_running.load()) {
         cv::Mat frame;
+        std::cout << "frame width: " << frame.cols << ", frame height: " << frame.rows << std::endl;
         {
             std::lock_guard<std::mutex> lock(g_frame_mutex);
             if (!g_latest_frame.empty()) frame = g_latest_frame.clone();
