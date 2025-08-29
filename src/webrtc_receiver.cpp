@@ -5,6 +5,7 @@
 #include <gst/video/video.h>
 
 #include <opencv2/opencv.hpp>
+#include <QApplication>
 
 #include <iostream>
 #include <string>
@@ -323,6 +324,7 @@ static void on_notify_ice_gathering(GObject* obj, GParamSpec* /*pspec*/, gpointe
 
 int main(int argc, char* argv[]) {
     gst_init(&argc, &argv);
+    QApplication app(argc, argv);
 
     const char* stun = "stun://stun.l.google.com:19302";
     if (argc >= 2) stun = argv[1];
@@ -361,6 +363,7 @@ int main(int argc, char* argv[]) {
     std::thread gst_thread([](){ g_main_loop_run(g_loop); });
 
     cv::namedWindow("WebRTC-Recv", cv::WINDOW_AUTOSIZE);
+    cv::startWindowThread();
     while (g_running.load()) {
         cv::Mat frame;
         {
