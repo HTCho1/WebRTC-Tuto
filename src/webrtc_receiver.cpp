@@ -54,14 +54,7 @@ static std::string sanitize_sdp_for_browser(const char* sdp_in) {
             if (low.find(" tcp ") != std::string::npos || low.find("\ttcp ") != std::string::npos || low.find(" tcptype ") != std::string::npos) {
                 continue;
             }
-            // srflx 후보 제거 (브라우저 파서 에러 회피용)
-            if (low.find(" typ srflx") != std::string::npos) {
-                continue;
-            }
-            // host 후보 제거 (GStreamer webrtcbin이 일부 host 후보 처리시 문제 발생)
-            if (low.find(" typ host") != std::string::npos) {
-                continue;
-            }
+            // 이전에는 srflx/host 후보를 제거했으나, 모든 ICE 후보를 전달하기 위해 유지합니다.
             // IPv6 주소 후보 제거 (일부 브라우저/환경에서 파서 민감)
             std::vector<std::string> tokens;
             {
