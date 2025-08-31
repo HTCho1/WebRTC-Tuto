@@ -9,6 +9,7 @@ pkg_check_modules(GST REQUIRED gstreamer-1.0 gstreamer-app-1.0 gstreamer-webrtc-
 
 # OpenCV (for imshow)
 find_package(OpenCV REQUIRED)
+# find_package(Qt5 COMPONENTS Widgets REQUIRED)
 
 add_executable(webrtc_receiver src/webrtc_receiver.cpp)
 
