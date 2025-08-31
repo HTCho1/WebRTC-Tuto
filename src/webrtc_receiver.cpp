@@ -5,6 +5,7 @@
 #include <gst/video/video.h>
 
 #include <opencv2/opencv.hpp>
+#include <QApplication>
 
 #include <iostream>
 #include <string>
@@ -305,6 +306,8 @@ static void on_notify_ice_gathering(GObject* obj, GParamSpec* /*pspec*/, gpointe
         g_free(sdp_str);
         gst_webrtc_session_description_free(local_desc);
 
+        GMainContext* ctx = g_main_loop_get_context(g_loop);
+
         std::thread([=]() {
             g_print("Paste the SDP ANSWER from browser, then end with a line: '===== END SDP ====='\n");
             std::string raw_answer = read_sdp_from_stdin();
@@ -314,13 +317,14 @@ static void on_notify_ice_gathering(GObject* obj, GParamSpec* /*pspec*/, gpointe
                 return;
             }
             // Pass the sanitized SDP to the main loop for processing
-            g_idle_add(on_answer_received, g_strdup(answer.c_str()));
+            g_main_context_invoke(ctx, on_answer_received, g_strdup(answer.c_str()));
         }).detach();
     }
 }
 
 int main(int argc, char* argv[]) {
     gst_init(&argc, &argv);
+    QApplication app(argc, argv);
 
     const char* stun = "stun://stun.l.google.com:19302";
     if (argc >= 2) stun = argv[1];
@@ -351,38 +355,38 @@ int main(int argc, char* argv[]) {
     if (vcaps) gst_caps_unref(vcaps);
     if (vtrans) gst_object_unref(vtrans);
 
-    std::thread ui_thread_func([](){
-        cv::namedWindow("WebRTC-Recv", cv::WINDOW_AUTOSIZE);
-        while (g_running.load()) {
-            cv::Mat frame;
-            {
-                std::lock_guard<std::mutex> lock(g_frame_mutex);
-                if (!g_latest_frame.empty()) frame = g_latest_frame.clone();
-            }
-            if (!frame.empty()) {
-                cv::imshow("WebRTC-Recv", frame);
-            }
-            int key = cv::waitKey(10);
-            if (key == 27 || key == 'q' || key == 'Q') {
-                g_running.store(false);
-                if (g_loop) g_main_loop_quit(g_loop);
-                break;
-            }
-        }
-        cv::destroyWindow("WebRTC-Recv");
-    });
-    ui_thread_func.detach();
-
     gst_element_set_state(g_pipeline, GST_STATE_PLAYING);
 
     g_print("\n[Receiver] Waiting... This app will create an SDP OFFER.\n");
     g_print("Once it prints the OFFER, paste it into the browser page.\n\n");
 
-    g_main_loop_run(g_loop);
+    std::thread gst_thread([](){ g_main_loop_run(g_loop); });
+
+    cv::namedWindow("WebRTC-Recv", cv::WINDOW_AUTOSIZE);
+    cv::startWindowThread();
+    while (g_running.load()) {
+        cv::Mat frame;
+        std::cout << "frame width: " << frame.cols << ", frame height: " << frame.rows << std::endl;
+        {
+            std::lock_guard<std::mutex> lock(g_frame_mutex);
+            if (!g_latest_frame.empty()) frame = g_latest_frame.clone();
+        }
+        if (!frame.empty()) {
+            cv::imshow("WebRTC-Recv", frame);
+        }
+        int key = cv::waitKey(10);
+        if (key == 27 || key == 'q' || key == 'Q') {
+            g_running.store(false);
+            if (g_loop) g_main_loop_quit(g_loop);
+            break;
+        }
+    }
+    cv::destroyWindow("WebRTC-Recv");
+
+    gst_thread.join();
 
     gst_element_set_state(g_pipeline, GST_STATE_NULL);
     gst_object_unref(g_pipeline);
     g_main_loop_unref(g_loop);
-    g_running.store(false);
     return 0;
 }
