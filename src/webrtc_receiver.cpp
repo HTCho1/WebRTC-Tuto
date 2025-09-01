@@ -15,48 +15,47 @@
 #include <algorithm>
 #include <sstream>
 
-static GMainLoop* g_loop = nullptr;
-static GstElement* g_pipeline = nullptr;
-static GstElement* g_webrtc = nullptr;
-static GstElement* g_appsink = nullptr; // 최종 RAW 프레임 수신 지점
+// GStreamer 메인 루프와 주요 요소들을 전역으로 보관한다.
+static GMainLoop* g_loop = nullptr;           // 이벤트 처리용 GLib 메인 루프
+static GstElement* g_pipeline = nullptr;      // 전체 GStreamer 파이프라인
+static GstElement* g_webrtc = nullptr;        // WebRTC 신호 교환을 담당하는 webrtcbin
+static GstElement* g_appsink = nullptr;       // 디코딩된 RAW 프레임이 도달하는 앱 싱크
 
 // UI 표시용 공유 프레임 버퍼
-static std::mutex g_frame_mutex;
-static cv::Mat g_latest_frame;
-static std::atomic<bool> g_running{true};
+// UI 스레드와 GStreamer 스레드가 프레임을 주고받기 위한 공유 자원
+static std::mutex g_frame_mutex;              // 프레임 보호용 뮤텍스
+static cv::Mat g_latest_frame;                // 가장 최근에 수신한 프레임
+static std::atomic<bool> g_running{true};     // 종료 플래그
 
+// 브라우저에서 전달된 SDP ANSWER가 설정되었는지 여부
 static std::atomic<bool> g_answer_set{false};
 
-// 브라우저 호환을 위해 SDP에서 문제 소지가 있는 라인들을 제거
+// 브라우저가 이해하지 못하는 SDP 라인을 제거하여 호환성을 높인다.
 static std::string sanitize_sdp_for_browser(const char* sdp_in) {
     std::string in = sdp_in ? sdp_in : "";
-    // CR 제거
-    in.erase(std::remove(in.begin(), in.end(), '\r'), in.end());
+    in.erase(std::remove(in.begin(), in.end(), '\r'), in.end()); // CR 제거
     std::stringstream iss(in);
     std::string line;
     std::ostringstream oss;
     while (std::getline(iss, line)) {
-        // 좌/우 공백 정리
+        // 각 줄의 앞뒤 공백을 정리한다.
         while (!line.empty() && (line.back() == '\r' || line.back() == '\n' || line.back() == ' ' || line.back() == '\t')) line.pop_back();
         size_t p = 0; while (p < line.size() && (line[p] == ' ' || line[p] == '\t')) ++p;
         std::string t = (p > 0) ? line.substr(p) : line;
 
-        // 헤더/푸터 제거 안전망
-        if (t.rfind("=====", 0) == 0) continue;
-        // a=end-of-candidates 제거 (파서 민감 회피)
-        if (t.rfind("a=end-of-candidates", 0) == 0) continue;
-        // a=rtcp-mux-only 제거 (오래된 사양, 호환성 문제 유발)
-        if (t.rfind("a=rtcp-mux-only", 0) == 0) continue;
+        // 가독성용 헤더/푸터나 브라우저가 거부하는 속성은 제거한다.
+        if (t.rfind("=====", 0) == 0) continue;              // README 스타일 구분선
+        if (t.rfind("a=end-of-candidates", 0) == 0) continue; // ICE 후보 종료 표시 제거
+        if (t.rfind("a=rtcp-mux-only", 0) == 0) continue;     // 오래된 속성
 
         if (t.rfind("a=candidate:", 0) == 0) {
             std::string low = t;
             std::transform(low.begin(), low.end(), low.begin(), [](unsigned char c){ return std::tolower(c); });
-            // TCP 후보 제거
+            // TCP 기반 후보는 브라우저에서 처리하지 못하는 경우가 있어 제거한다.
             if (low.find(" tcp ") != std::string::npos || low.find("\ttcp ") != std::string::npos || low.find(" tcptype ") != std::string::npos) {
                 continue;
             }
-            // 이전에는 srflx/host 후보를 제거했으나, 모든 ICE 후보를 전달하기 위해 유지합니다.
-            // IPv6 주소 후보 제거 (일부 브라우저/환경에서 파서 민감)
+            // IPv6 주소 후보는 일부 환경에서 파싱 문제가 발생할 수 있어 제외한다.
             std::vector<std::string> tokens;
             {
                 std::istringstream ts(t);
@@ -66,29 +65,28 @@ static std::string sanitize_sdp_for_browser(const char* sdp_in) {
             if (tokens.size() >= 6) {
                 const std::string& addr = tokens[4];
                 if (addr.find(':') != std::string::npos) {
-                    // IPv6
-                    continue;
+                    continue; // IPv6 주소
                 }
             }
         }
 
-        // RFC를 더 잘 따르도록 CRLF로 줄바꿈
+        // RFC 4566에 맞춰 CRLF로 줄바꿈을 맞춘다.
         oss << t << "\r\n";
     }
     return oss.str();
 }
 
-// ===== 유틸: STDIN에서 "===== END SDP =====" 까지 읽기 =====
+// 터미널에서 사용자가 붙여넣은 SDP를 끝 마커까지 읽어온다.
 static std::string read_sdp_from_stdin() {
     std::string line, sdp;
     while (std::getline(std::cin, line)) {
-        if (line.find("===== END SDP =====") != std::string::npos) break;
-        sdp += line + "\n";
+        if (line.find("===== END SDP =====") != std::string::npos) break; // 끝 표시를 만나면 종료
+        sdp += line + "\n"; // 줄 단위로 누적
     }
     return sdp;
 }
 
-// ===== 메인 스레드에서 SDP ANSWER 처리 =====
+// 메인 루프 컨텍스트에서 실행되어 브라우저로부터 받은 ANSWER SDP를 webrtcbin에 설정한다.
 static gboolean on_answer_received(gpointer data) {
     char* answer_sdp_str = static_cast<char*>(data);
     if (!answer_sdp_str || *answer_sdp_str == '\0') {
@@ -131,14 +129,15 @@ static gboolean on_answer_received(gpointer data) {
     g_print("[main thread] Remote description set successfully.\n");
 
     g_free(answer_sdp_str); // 문자열 메모리 해제
-    return G_SOURCE_REMOVE; // 이 함수를 다시 호출하지 않음
+    return G_SOURCE_REMOVE; // 이 함수는 한 번만 실행되므로 핸들러 제거
 }
 
 
 // ===== appsink 콜백: RAW 프레임 수신 =====
+// appsink에서 새로운 프레임을 가져와 OpenCV 포맷으로 변환한다.
 static GstFlowReturn on_new_sample(GstElement* sink, gpointer /*user_data*/) {
     GstSample* sample = gst_app_sink_pull_sample(GST_APP_SINK(sink));
-    if (!sample) return GST_FLOW_OK;
+    if (!sample) return GST_FLOW_OK; // EOF 또는 오류 시 nullptr
 
     GstCaps* caps = gst_sample_get_caps(sample);
     if (!caps) {
@@ -159,20 +158,24 @@ static GstFlowReturn on_new_sample(GstElement* sink, gpointer /*user_data*/) {
     }
 
     GstVideoFrame vframe;
+    // GstBuffer를 읽기 전용으로 매핑하여 영상 메타데이터를 얻는다.
     if (gst_video_frame_map(&vframe, &vinfo, buffer, GST_MAP_READ)) {
         int width  = GST_VIDEO_FRAME_WIDTH(&vframe);
         int height = GST_VIDEO_FRAME_HEIGHT(&vframe);
         int stride = GST_VIDEO_FRAME_PLANE_STRIDE(&vframe, 0);
         guint8* data = reinterpret_cast<guint8*>(GST_VIDEO_FRAME_PLANE_DATA(&vframe, 0));
 
+        // GStreamer가 관리하는 메모리를 OpenCV 행렬로 감싸고,
+        // 별도의 복사본을 만들어 공유 메모리 문제를 방지한다.
         cv::Mat view(height, width, CV_8UC3, data, stride);
         cv::Mat copy;
         view.copyTo(copy);
         {
             std::lock_guard<std::mutex> lock(g_frame_mutex);
-            g_latest_frame = std::move(copy);
+            g_latest_frame = std::move(copy); // 최신 프레임 갱신
         }
 
+        // 60 프레임마다 디버그 정보를 출력한다.
         static int counter = 0;
         if ((counter++ % 60) == 0) {
             auto pts_ns = GST_BUFFER_PTS(buffer);
@@ -188,6 +191,7 @@ static GstFlowReturn on_new_sample(GstElement* sink, gpointer /*user_data*/) {
 }
 
 // decodebin -> videoconvert -> capsfilter(BGR) -> appsink
+// decodebin이 새 패드를 노출하면 비디오 파이프라인을 구성하여 appsink로 연결한다.
 static void on_decodebin_pad_added(GstElement* decodebin, GstPad* pad, gpointer /*user_data*/) {
     g_print("\n[DEBUG] on_decodebin_pad_added CALLED\n");
     GstCaps* caps = gst_pad_get_current_caps(pad);
@@ -207,6 +211,7 @@ static void on_decodebin_pad_added(GstElement* decodebin, GstPad* pad, gpointer 
             return;
         }
 
+        // BGR 포맷으로 맞춘 후 appsink로 보낸다.
         GstCaps* rawcaps = gst_caps_from_string("video/x-raw,format=BGR");
         g_object_set(capsfilter, "caps", rawcaps, nullptr);
         gst_caps_unref(rawcaps);
@@ -232,6 +237,7 @@ static void on_decodebin_pad_added(GstElement* decodebin, GstPad* pad, gpointer 
         }
         gst_object_unref(sinkpad);
 
+        // 새로 추가한 요소들이 상위 파이프라인과 동일한 상태를 갖도록 맞춘다.
         gst_element_sync_state_with_parent(videoconvert);
         gst_element_sync_state_with_parent(videoscale);
         gst_element_sync_state_with_parent(capsfilter);
@@ -241,12 +247,14 @@ static void on_decodebin_pad_added(GstElement* decodebin, GstPad* pad, gpointer 
     if (caps) gst_caps_unref(caps);
 }
 
+// webrtcbin이 새로운 RTP 스트림 패드를 제공하면 디코딩을 위한 큐와 decodebin을 연결한다.
 static void on_incoming_stream(GstElement* /*webrtc*/, GstPad* pad, gpointer /*user_data*/) {
     g_print("\n[DEBUG] on_incoming_stream CALLED\n");
     GstCaps* caps = gst_pad_get_current_caps(pad);
     const gchar* name = gst_structure_get_name(gst_caps_get_structure(caps, 0));
     g_print("[DEBUG] Incoming stream is of type: %s\n", name);
 
+    // 비디오 RTP 스트림만 처리한다.
     if (!g_str_has_prefix(name, "application/x-rtp")) {
         if (caps) gst_caps_unref(caps);
         return;
@@ -274,11 +282,13 @@ static void on_incoming_stream(GstElement* /*webrtc*/, GstPad* pad, gpointer /*u
         g_printerr("Failed to link queue -> decodebin\n");
     }
 
+    // decodebin이 실제로 비디오 스트림을 감지하면 on_decodebin_pad_added가 호출된다.
     g_signal_connect(decodebin, "pad-added", G_CALLBACK(on_decodebin_pad_added), nullptr);
 
     if (caps) gst_caps_unref(caps);
 }
 
+// webrtcbin에서 OFFER가 생성되면 로컬 SDP를 설정한다.
 static void on_offer_created(GstPromise* promise, gpointer /*user_data*/) {
     const GstStructure* reply = gst_promise_get_reply(promise);
     GstWebRTCSessionDescription* offer = nullptr;
@@ -288,11 +298,13 @@ static void on_offer_created(GstPromise* promise, gpointer /*user_data*/) {
     gst_promise_unref(promise);
 }
 
+// 원격 피어와의 협상이 필요해지면 새로운 OFFER 생성을 요청한다.
 static void on_negotiation_needed(GstElement* /*webrtc*/, gpointer /*user_data*/) {
     GstPromise* promise = gst_promise_new_with_change_func(on_offer_created, nullptr, nullptr);
     g_signal_emit_by_name(g_webrtc, "create-offer", nullptr, promise);
 }
 
+// ICE 후보 수집이 완료되면 SDP OFFER를 출력하고 사용자에게 ANSWER를 입력받는다.
 static void on_notify_ice_gathering(GObject* obj, GParamSpec* /*pspec*/, gpointer /*user_data*/) {
     GstWebRTCICEGatheringState state;
     g_object_get(obj, "ice-gathering-state", &state, nullptr);
@@ -308,6 +320,7 @@ static void on_notify_ice_gathering(GObject* obj, GParamSpec* /*pspec*/, gpointe
 
         GMainContext* ctx = g_main_loop_get_context(g_loop);
 
+        // 별도 스레드에서 사용자 입력을 기다린 후 메인 루프로 전달한다.
         std::thread([=]() {
             g_print("Paste the SDP ANSWER from browser, then end with a line: '===== END SDP ====='\n");
             std::string raw_answer = read_sdp_from_stdin();
@@ -316,19 +329,20 @@ static void on_notify_ice_gathering(GObject* obj, GParamSpec* /*pspec*/, gpointe
                 g_printerr("Empty ANSWER received, not processing.\n");
                 return;
             }
-            // Pass the sanitized SDP to the main loop for processing
+            // 정제된 SDP를 메인 루프로 전달하여 on_answer_received가 실행되게 한다.
             g_main_context_invoke(ctx, on_answer_received, g_strdup(answer.c_str()));
         }).detach();
     }
 }
 
 int main(int argc, char* argv[]) {
-    gst_init(&argc, &argv);
-    // QApplication app(argc, argv);
+    gst_init(&argc, &argv); // GStreamer 초기화
+    // QApplication app(argc, argv); // Qt 기반 GUI를 사용한다면 주석 해제
 
-    const char* stun = "stun://stun.l.google.com:19302";
-    if (argc >= 2) stun = argv[1];
+    const char* stun = "stun://stun.l.google.com:19302"; // 기본 STUN 서버
+    if (argc >= 2) stun = argv[1]; // 사용자 지정 STUN 서버
 
+    // 메인 루프와 파이프라인을 초기화한다.
     GMainContext* main_ctx = g_main_context_new();
     g_loop = g_main_loop_new(main_ctx, FALSE);
     g_main_context_unref(main_ctx);
@@ -340,14 +354,15 @@ int main(int argc, char* argv[]) {
         return -1;
     }
 
+    // webrtcbin 설정 및 파이프라인 구성
     g_object_set(g_webrtc, "stun-server", stun, nullptr);
-
     gst_bin_add(GST_BIN(g_pipeline), g_webrtc);
 
     g_signal_connect(g_webrtc, "on-negotiation-needed", G_CALLBACK(on_negotiation_needed), nullptr);
     g_signal_connect(g_webrtc, "pad-added", G_CALLBACK(on_incoming_stream), nullptr);
     g_signal_connect(g_webrtc, "notify::ice-gathering-state", G_CALLBACK(on_notify_ice_gathering), nullptr);
 
+    // 원격에서 들어올 VP8 비디오 스트림을 받아들이도록 트랜시버 추가
     GstCaps* vcaps = gst_caps_from_string(
         "application/x-rtp,media=video,encoding-name=VP8,payload=96,clock-rate=90000");
     GstWebRTCRTPTransceiver* vtrans = nullptr;
@@ -362,26 +377,28 @@ int main(int argc, char* argv[]) {
     g_print("\n[Receiver] Waiting... This app will create an SDP OFFER.\n");
     g_print("Once it prints the OFFER, paste it into the browser page.\n\n");
 
+    // GStreamer 메인 루프는 별도 스레드에서 돌려 UI와 분리한다.
     std::thread gst_thread([]() {
         GMainContext* ctx = g_main_loop_get_context(g_loop);
         g_main_context_push_thread_default(ctx);
-        g_main_loop_run(g_loop);
+        g_main_loop_run(g_loop); // 블로킹 호출
         g_main_context_pop_thread_default(ctx);
-        g_running.store(false);
+        g_running.store(false); // 루프가 종료되면 메인 루프도 종료
     });
 
+    // 메인 스레드에서는 최신 프레임을 화면에 표시한다.
     cv::namedWindow("WebRTC-Recv", cv::WINDOW_AUTOSIZE);
     while (g_running.load()) {
         cv::Mat frame;
         {
             std::lock_guard<std::mutex> lock(g_frame_mutex);
-            if (!g_latest_frame.empty()) frame = g_latest_frame.clone();
+            if (!g_latest_frame.empty()) frame = g_latest_frame.clone(); // 최신 프레임 복사
         }
         if (!frame.empty()) {
             std::cout << "frame width: " << frame.cols << ", frame height: " << frame.rows << std::endl;
             cv::imshow("WebRTC-Recv", frame);
         }
-        int key = cv::waitKey(10);
+        int key = cv::waitKey(10); // 키 입력 처리
         if (key == 27 || key == 'q' || key == 'Q') {
             g_running.store(false);
             if (g_loop) g_main_loop_quit(g_loop);
@@ -391,6 +408,7 @@ int main(int argc, char* argv[]) {
     cv::destroyWindow("WebRTC-Recv");
     gst_thread.join();
 
+    // 종료 시 자원 정리
     gst_element_set_state(g_pipeline, GST_STATE_NULL);
     gst_object_unref(g_pipeline);
     g_main_loop_unref(g_loop);
