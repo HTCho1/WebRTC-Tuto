@@ -360,30 +360,31 @@ int main(int argc, char* argv[]) {
     g_print("\n[Receiver] Waiting... This app will create an SDP OFFER.\n");
     g_print("Once it prints the OFFER, paste it into the browser page.\n\n");
 
-    std::thread gst_thread([](){ g_main_loop_run(g_loop); });
+    std::thread ui_thread([]() {
+        cv::namedWindow("WebRTC-Recv", cv::WINDOW_AUTOSIZE);
+        while (g_running.load()) {
+            cv::Mat frame;
+            std::cout << "frame width: " << frame.cols << ", frame height: " << frame.rows << std::endl;
+            {
+                std::lock_guard<std::mutex> lock(g_frame_mutex);
+                if (!g_latest_frame.empty()) frame = g_latest_frame.clone();
+            }
+            if (!frame.empty()) {
+                cv::imshow("WebRTC-Recv", frame);
+            }
+            int key = cv::waitKey(10);
+            if (key == 27 || key == 'q' || key == 'Q') {
+                g_running.store(false);
+                if (g_loop) g_main_loop_quit(g_loop);
+                break;
+            }
+        }
+        cv::destroyWindow("WebRTC-Recv");
+    });
 
-    cv::namedWindow("WebRTC-Recv", cv::WINDOW_AUTOSIZE);
-    cv::startWindowThread();
-    while (g_running.load()) {
-        cv::Mat frame;
-        std::cout << "frame width: " << frame.cols << ", frame height: " << frame.rows << std::endl;
-        {
-            std::lock_guard<std::mutex> lock(g_frame_mutex);
-            if (!g_latest_frame.empty()) frame = g_latest_frame.clone();
-        }
-        if (!frame.empty()) {
-            cv::imshow("WebRTC-Recv", frame);
-        }
-        int key = cv::waitKey(10);
-        if (key == 27 || key == 'q' || key == 'Q') {
-            g_running.store(false);
-            if (g_loop) g_main_loop_quit(g_loop);
-            break;
-        }
-    }
-    cv::destroyWindow("WebRTC-Recv");
-
-    gst_thread.join();
+    g_main_loop_run(g_loop);
+    g_running.store(false);
+    ui_thread.join();
 
     gst_element_set_state(g_pipeline, GST_STATE_NULL);
     gst_object_unref(g_pipeline);
