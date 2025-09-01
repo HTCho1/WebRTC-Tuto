@@ -329,7 +329,9 @@ int main(int argc, char* argv[]) {
     const char* stun = "stun://stun.l.google.com:19302";
     if (argc >= 2) stun = argv[1];
 
-    g_loop = g_main_loop_new(nullptr, FALSE);
+    GMainContext* main_ctx = g_main_context_new();
+    g_loop = g_main_loop_new(main_ctx, FALSE);
+    g_main_context_unref(main_ctx);
 
     g_pipeline = gst_pipeline_new("webrtc-recv-pipeline");
     g_webrtc = gst_element_factory_make("webrtcbin", "webrtcbin");
@@ -360,31 +362,34 @@ int main(int argc, char* argv[]) {
     g_print("\n[Receiver] Waiting... This app will create an SDP OFFER.\n");
     g_print("Once it prints the OFFER, paste it into the browser page.\n\n");
 
-    std::thread ui_thread([]() {
-        cv::namedWindow("WebRTC-Recv", cv::WINDOW_AUTOSIZE);
-        while (g_running.load()) {
-            cv::Mat frame;
-            std::cout << "frame width: " << frame.cols << ", frame height: " << frame.rows << std::endl;
-            {
-                std::lock_guard<std::mutex> lock(g_frame_mutex);
-                if (!g_latest_frame.empty()) frame = g_latest_frame.clone();
-            }
-            if (!frame.empty()) {
-                cv::imshow("WebRTC-Recv", frame);
-            }
-            int key = cv::waitKey(10);
-            if (key == 27 || key == 'q' || key == 'Q') {
-                g_running.store(false);
-                if (g_loop) g_main_loop_quit(g_loop);
-                break;
-            }
-        }
-        cv::destroyWindow("WebRTC-Recv");
+    std::thread gst_thread([]() {
+        GMainContext* ctx = g_main_loop_get_context(g_loop);
+        g_main_context_push_thread_default(ctx);
+        g_main_loop_run(g_loop);
+        g_main_context_pop_thread_default(ctx);
+        g_running.store(false);
     });
 
-    g_main_loop_run(g_loop);
-    g_running.store(false);
-    ui_thread.join();
+    cv::namedWindow("WebRTC-Recv", cv::WINDOW_AUTOSIZE);
+    while (g_running.load()) {
+        cv::Mat frame;
+        {
+            std::lock_guard<std::mutex> lock(g_frame_mutex);
+            if (!g_latest_frame.empty()) frame = g_latest_frame.clone();
+        }
+        if (!frame.empty()) {
+            std::cout << "frame width: " << frame.cols << ", frame height: " << frame.rows << std::endl;
+            cv::imshow("WebRTC-Recv", frame);
+        }
+        int key = cv::waitKey(10);
+        if (key == 27 || key == 'q' || key == 'Q') {
+            g_running.store(false);
+            if (g_loop) g_main_loop_quit(g_loop);
+            break;
+        }
+    }
+    cv::destroyWindow("WebRTC-Recv");
+    gst_thread.join();
 
     gst_element_set_state(g_pipeline, GST_STATE_NULL);
     gst_object_unref(g_pipeline);
